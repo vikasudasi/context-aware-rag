@@ -1,0 +1,14 @@
+# Global-Context-Aware RAG — local dependencies
+# Tesseract must be installed on the system; Ollama must be running locally.
+
+pymupdf>=1.24.0
+pymupdf4llm>=0.0.18
+pymupdf-layout>=0.0.14
+ollama>=0.2.0
+chromadb>=0.4.0
+langchain-text-splitters>=0.2.0
+pydantic>=2.0.0
+streamlit>=1.28.0
+
+# Optional: improves OCR heuristics for scanned PDFs (OpenCV)
+opencv-python>=4.8.0
