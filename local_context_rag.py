@@ -21,7 +21,7 @@ import pymupdf4llm
 import pymupdf
 import ollama
 import chromadb
-from langchain_text_splitters import MarkdownHeaderTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)
@@ -135,11 +135,15 @@ DEFAULT_MODEL = "llama3.2"
 KNOWLEDGE_MARKDOWN_HEADER = "# Knowledge\n\n## Glossary\n\n"
 KNOWLEDGE_TOPIC_HEADER = "\n## Topic Index\n\n"
 DEFAULT_KNOWLEDGE_CONTENT = KNOWLEDGE_MARKDOWN_HEADER + "(empty)\n" + KNOWLEDGE_TOPIC_HEADER + "(empty)\n"
-MAX_MARKDOWN_FOR_KNOWLEDGE = 12000  # truncate for LLM context
+MAX_MARKDOWN_FOR_KNOWLEDGE = 12000  # chars per window sent to LLM for knowledge extraction
+KNOWLEDGE_WINDOW_OVERLAP = 500      # overlap between consecutive extraction windows
 # 50% of 128K context: ~64K tokens * 4 chars/token ≈ 256K chars
 THRESHOLD_KNOWLEDGE_CHARS = 256000
-MAX_KNOWLEDGE_FOR_COMPACT = 80000  # max chars of knowledge.md to send to compaction LLM
+MAX_KNOWLEDGE_FOR_COMPACT = 80000  # max chars per compaction window sent to LLM
 N_QUERY_RESULTS = 8
+MAX_CHUNK_SIZE = 1500   # max chars per vector-store chunk (secondary splitter)
+CHUNK_OVERLAP = 150     # overlap for RecursiveCharacterTextSplitter
+PDF_PAGE_BATCH_SIZE = 50  # pages per batch for converting large PDFs
 
 
 def _chroma_safe_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
@@ -204,11 +208,25 @@ class LocalContextRAG:
         """
         content = self._ensure_knowledge_file()
 
-        # Build new glossary lines and topic lines
+        # Parse existing terms/topics to avoid duplicates
+        existing_terms: set[str] = set()
+        existing_topics: set[str] = set()
+        for line in content.split("\n"):
+            m = re.match(r"^- \*\*(.+?)\*\*:", line)
+            if m:
+                existing_terms.add(m.group(1).lower().strip())
+            elif line.startswith("- ") and "**" not in line:
+                existing_topics.add(line[2:].lower().strip())
+
+        # Build new glossary lines and topic lines (skip duplicates)
         new_glossary_lines = []
         for e in parsed.glossary:
-            new_glossary_lines.append(f"- **{e.term}**: {e.definition}")
-        new_topic_lines = [f"- {t}" for t in parsed.topic_index]
+            if e.term.lower().strip() not in existing_terms:
+                new_glossary_lines.append(f"- **{e.term}**: {e.definition}")
+        new_topic_lines = []
+        for t in parsed.topic_index:
+            if t.lower().strip() not in existing_topics:
+                new_topic_lines.append(f"- {t}")
 
         # Parse existing sections (simple: find ## Glossary and ## Topic Index)
         glossary_marker = "## Glossary"
@@ -239,24 +257,9 @@ class LocalContextRAG:
         if len(new_content) >= THRESHOLD_KNOWLEDGE_CHARS:
             self._compact_knowledge()
 
-    def _compact_knowledge(self) -> None:
-        """
-        If knowledge.md exceeds THRESHOLD_KNOWLEDGE_CHARS (50% of ~128K context),
-        call Ollama to produce a condensed glossary and topic index, then overwrite
-        the file so it stays precise and within context window.
-        """
-        content = self._ensure_knowledge_file()
-        if len(content) < THRESHOLD_KNOWLEDGE_CHARS:
-            return
-        logger.info(
-            "Compacting knowledge.md (current size %d chars, threshold %d).",
-            len(content),
-            THRESHOLD_KNOWLEDGE_CHARS,
-        )
-        knowledge_preview = content[:MAX_KNOWLEDGE_FOR_COMPACT]
-        if len(content) > MAX_KNOWLEDGE_FOR_COMPACT:
-            knowledge_preview += "\n\n... (truncated for compaction)"
-        user_msg = PROMPTS["knowledge_compact_user"].format(knowledge_preview=knowledge_preview)
+    def _compact_window(self, window: str) -> KnowledgeSchema | None:
+        """Call Ollama to compact a single window of knowledge content."""
+        user_msg = PROMPTS["knowledge_compact_user"].format(knowledge_preview=window)
         try:
             response = ollama.chat(
                 model=self.model,
@@ -266,11 +269,61 @@ class LocalContextRAG:
                 ],
                 format=KnowledgeSchema.model_json_schema(),
             )
-            raw_content = response.message.content or ""
+            raw = response.message.content or ""
         except Exception as e:
-            logger.warning("Ollama knowledge compaction failed: %s", e)
+            logger.warning("Ollama compaction window failed: %s", e)
+            return None
+        return self._safe_parse_knowledge(raw)
+
+    def _compact_knowledge(self) -> None:
+        """
+        If knowledge.md exceeds THRESHOLD_KNOWLEDGE_CHARS (50% of ~128K context),
+        call Ollama to produce a condensed glossary and topic index.
+
+        For knowledge.md larger than MAX_KNOWLEDGE_FOR_COMPACT, uses a multi-pass
+        sliding window so no content is silently truncated: each window is compacted
+        independently, results are deduplicated, and a final pass merges the whole.
+        """
+        content = self._ensure_knowledge_file()
+        if len(content) < THRESHOLD_KNOWLEDGE_CHARS:
             return
-        parsed = self._safe_parse_knowledge(raw_content)
+        logger.info(
+            "Compacting knowledge.md (current size %d chars, threshold %d).",
+            len(content),
+            THRESHOLD_KNOWLEDGE_CHARS,
+        )
+
+        if len(content) <= MAX_KNOWLEDGE_FOR_COMPACT:
+            # Single-pass (original behaviour for smaller files)
+            parsed = self._compact_window(content)
+        else:
+            # Multi-pass: compact each window, deduplicate across windows
+            logger.info(
+                "knowledge.md exceeds single-window limit (%d chars); using multi-pass compaction.",
+                MAX_KNOWLEDGE_FOR_COMPACT,
+            )
+            all_glossary: list[GlossaryEntry] = []
+            all_topics: list[str] = []
+            seen_terms: set[str] = set()
+            seen_topics: set[str] = set()
+            step = MAX_KNOWLEDGE_FOR_COMPACT - KNOWLEDGE_WINDOW_OVERLAP
+            for start in range(0, len(content), step):
+                window = content[start : start + MAX_KNOWLEDGE_FOR_COMPACT]
+                result = self._compact_window(window)
+                if result is None:
+                    continue
+                for e in result.glossary:
+                    key = e.term.lower().strip()
+                    if key and key not in seen_terms:
+                        seen_terms.add(key)
+                        all_glossary.append(e)
+                for t in result.topic_index:
+                    key = t.lower().strip()
+                    if key and key not in seen_topics:
+                        seen_topics.add(key)
+                        all_topics.append(t)
+            parsed = KnowledgeSchema(glossary=all_glossary, topic_index=all_topics) if (all_glossary or all_topics) else None
+
         if parsed is None:
             logger.warning("Compaction parse failed; knowledge.md unchanged.")
             return
@@ -299,6 +352,65 @@ class LocalContextRAG:
         except Exception as e:
             logger.warning("Failed to parse knowledge JSON: %s", e)
             return None
+
+    def _extract_knowledge_window(self, window: str) -> KnowledgeSchema | None:
+        """Call Ollama to extract glossary and topic index from a single markdown window."""
+        user_msg = PROMPTS["knowledge_extract_user"].format(markdown_preview=window)
+        try:
+            response = ollama.chat(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": PROMPTS["knowledge_extract_system"]},
+                    {"role": "user", "content": user_msg},
+                ],
+                format=KnowledgeSchema.model_json_schema(),
+            )
+            raw = response.message.content or ""
+        except Exception as e:
+            logger.warning("Ollama knowledge extraction window failed: %s", e)
+            return None
+        return self._safe_parse_knowledge(raw)
+
+    def _extract_all_knowledge(self, md: str) -> KnowledgeSchema:
+        """
+        Extract a unified KnowledgeSchema from the full markdown by sliding a window
+        of MAX_MARKDOWN_FOR_KNOWLEDGE chars with KNOWLEDGE_WINDOW_OVERLAP overlap.
+        Deduplicates glossary terms and topics across all windows.
+        """
+        all_glossary: list[GlossaryEntry] = []
+        all_topics: list[str] = []
+        seen_terms: set[str] = set()
+        seen_topics: set[str] = set()
+
+        step = MAX_MARKDOWN_FOR_KNOWLEDGE - KNOWLEDGE_WINDOW_OVERLAP
+        total = len(md)
+        window_count = 0
+        for start in range(0, total, step):
+            window = md[start : start + MAX_MARKDOWN_FOR_KNOWLEDGE]
+            if not window.strip():
+                continue
+            window_count += 1
+            parsed = self._extract_knowledge_window(window)
+            if parsed is None:
+                continue
+            for entry in parsed.glossary:
+                key = entry.term.lower().strip()
+                if key and key not in seen_terms:
+                    seen_terms.add(key)
+                    all_glossary.append(entry)
+            for topic in parsed.topic_index:
+                key = topic.lower().strip()
+                if key and key not in seen_topics:
+                    seen_topics.add(key)
+                    all_topics.append(topic)
+
+        logger.info(
+            "Knowledge extraction complete: %d windows, %d terms, %d topics.",
+            window_count,
+            len(all_glossary),
+            len(all_topics),
+        )
+        return KnowledgeSchema(glossary=all_glossary, topic_index=all_topics)
 
     def _safe_parse_search_queries(self, raw: str, fallback_query: str) -> SearchQueries:
         """Parse LLM response into SearchQueries; on failure return fallback (same query 3 times)."""
@@ -339,12 +451,26 @@ class LocalContextRAG:
         if not pdf_path.is_file():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-        # 1) Parse PDF to Markdown (pymupdf.layout already imported -> OCR used when needed)
+        # 1) Parse PDF to Markdown in page batches (handles large files without full-memory load)
         logger.info("Parsing PDF to markdown: %s", pdf_path)
         try:
             doc = pymupdf.open(pdf_path)
             try:
-                md = pymupdf4llm.to_markdown(doc)
+                total_pages = len(doc)
+                if total_pages <= PDF_PAGE_BATCH_SIZE:
+                    md = pymupdf4llm.to_markdown(doc)
+                else:
+                    logger.info(
+                        "Large PDF (%d pages); converting in batches of %d.",
+                        total_pages,
+                        PDF_PAGE_BATCH_SIZE,
+                    )
+                    parts: list[str] = []
+                    for start in range(0, total_pages, PDF_PAGE_BATCH_SIZE):
+                        end = min(start + PDF_PAGE_BATCH_SIZE, total_pages)
+                        batch_pages = list(range(start, end))
+                        parts.append(pymupdf4llm.to_markdown(doc, pages=batch_pages))
+                    md = "\n\n".join(parts)
             finally:
                 doc.close()
         except Exception as e:
@@ -355,14 +481,30 @@ class LocalContextRAG:
             logger.warning("PDF produced empty markdown; skipping chunk upsert, still attempting knowledge update.")
             md = "(Document produced no text content.)"
 
-        # 2) Chunk by headers
+        # 2) Chunk by headers, then sub-chunk any oversized sections with a character splitter
         headers_to_split_on = [
             ("#", "h1"),
             ("##", "h2"),
             ("###", "h3"),
         ]
-        splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
-        chunks = splitter.split_text(md)
+        header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+        raw_chunks = header_splitter.split_text(md)
+
+        char_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=MAX_CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+        )
+        chunks = []
+        for chunk in raw_chunks:
+            if len(chunk.page_content) > MAX_CHUNK_SIZE:
+                sub_docs = char_splitter.create_documents(
+                    [chunk.page_content],
+                    metadatas=[dict(chunk.metadata)],
+                )
+                chunks.extend(sub_docs)
+            else:
+                chunks.append(chunk)
+        logger.info("Split into %d chunks (%d raw header chunks).", len(chunks), len(raw_chunks))
 
         # 3) Upsert into ChromaDB
         if chunks:
@@ -391,30 +533,14 @@ class LocalContextRAG:
                 )
                 logger.info("Upserted %d chunks to ChromaDB.", len(ids_list))
 
-        # 4) Update knowledge.md via Ollama
-        markdown_preview = md[:MAX_MARKDOWN_FOR_KNOWLEDGE]
-        if len(md) > MAX_MARKDOWN_FOR_KNOWLEDGE:
-            markdown_preview += "\n\n... (truncated)"
-        user_msg = PROMPTS["knowledge_extract_user"].format(markdown_preview=markdown_preview)
-        try:
-            response = ollama.chat(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": PROMPTS["knowledge_extract_system"]},
-                    {"role": "user", "content": user_msg},
-                ],
-                format=KnowledgeSchema.model_json_schema(),
-            )
-            content = response.message.content
-        except Exception as e:
-            logger.warning("Ollama knowledge extraction call failed: %s", e)
-            content = ""
-        parsed = self._safe_parse_knowledge(content) if content else None
-        if parsed is not None:
+        # 4) Update knowledge.md via Ollama (full-document multi-window extraction)
+        logger.info("Extracting knowledge from full document (%d chars) via sliding window.", len(md))
+        parsed = self._extract_all_knowledge(md)
+        if parsed.glossary or parsed.topic_index:
             self._merge_knowledge(parsed)
             logger.info("Merged knowledge (glossary=%d, topics=%d).", len(parsed.glossary), len(parsed.topic_index))
         else:
-            logger.warning("Skipped knowledge merge due to parse failure.")
+            logger.warning("Skipped knowledge merge: no entries extracted from document.")
 
     def get_knowledge_content(self) -> str:
         """
