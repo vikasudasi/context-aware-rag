@@ -78,3 +78,7 @@ rag.ask_question("What is the main topic?")
 - `app.py` — Streamlit UI (Upload PDF, Ask Question, Knowledge Base, Search Vector DB, Settings)
 - `knowledge.md` — created/updated by ingestion (glossary + topic index); compacted automatically when it grows too large
 - `chroma_db/` — ChromaDB persistence (default path)
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
