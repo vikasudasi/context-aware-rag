@@ -57,15 +57,17 @@ Each query should be a short, specific phrase (3-10 words) targeting different a
 User question: {question}
 
 Generate exactly 3 vector search queries (as a JSON object with key "queries", list of 3 strings). No other text.""",
-    "answer_synthesize_system": """You are a precise assistant. Answer the user's question using ONLY the provided context. Each context block is labeled with [Source: filename]. You must cite sources: in your answer, indicate which source(s) support each claim (e.g. by filename). In the "citations" array, list each source you used with a short excerpt (quote) that supports the answer. Do not invent facts. Keep the answer concise and grounded in the context. Output only valid JSON matching the schema: "answer" (string) and "citations" (list of {"source": "filename", "quote": "short excerpt"}).""",
-    "answer_synthesize_user": """Context from the knowledge base (each block is labeled with its source file):
+    "answer_synthesize_system": """You are a precise assistant. Answer the user's question using ONLY the provided context. Each context block is labeled with [Source: filename]. You must cite sources using ONLY the exact source filenames that are listed as "Valid source filenames" in the user message—do not invent or use any other filenames. In the "citations" array, use only those exact strings for "source". Do not invent facts. Keep the answer concise and grounded in the context. Output only valid JSON matching the schema: "answer" (string) and "citations" (list of {"source": "filename", "quote": "short excerpt"}).""",
+    "answer_synthesize_user": """Valid source filenames (use ONLY these exact strings in citations, no others): {valid_sources}
+
+Context from the knowledge base (each block is labeled with its source file):
 ---
 {context}
 ---
 
 User question: {question}
 
-Provide your response as JSON only: "answer" (full answer text, citing sources by filename where relevant), "citations" (list of objects with "source" = filename and "quote" = a short excerpt from that source that supports the answer).""",
+Provide your response as JSON only: "answer" (full answer text, citing sources by filename where relevant), "citations" (list of objects with "source" = one of the valid filenames above and "quote" = a short excerpt from that source that supports the answer). Do not use any source name that is not in the valid list.""",
     "knowledge_compact_system": """You are a knowledge compactor. Given a knowledge base (glossary and topic index), you must output a JSON object with exactly two keys: "glossary" and "topic_index".
 
 Your goal is to keep only what is essential for understanding the corpus and for rewriting user questions into good vector-search queries. You must:
@@ -452,14 +454,14 @@ class LocalContextRAG:
             out.append({"text": doc_text, "source": source, "metadata": meta})
         return out
 
-    def ask_question(self, question: str) -> AnswerWithCitations | None:
+    def ask_question(self, question: str) -> tuple[AnswerWithCitations | None, str]:
         """
         Answer a question: read knowledge.md, expand to 3 queries, retrieve from ChromaDB
         (with source filename per chunk), dedupe, then get a structured answer with
         citations from Ollama.
 
         :param question: User question string.
-        :return: Structured answer with citations, or None on failure.
+        :return: Tuple of (parsed answer with citations, or None on failure; raw JSON string from Ollama).
         """
         # 1) Read knowledge.md (compact if over threshold)
         knowledge_content = self._ensure_knowledge_file()
@@ -522,9 +524,12 @@ class LocalContextRAG:
             f"[Source: {source}]\n{text}" for text, source in chunks_with_sources
         ]
         context = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant context found."
+        valid_sources = ", ".join(sorted({source for _, source in chunks_with_sources}))
 
         # 4) Structured answer with citations (non-streaming for JSON)
-        user_msg = PROMPTS["answer_synthesize_user"].format(context=context, question=question)
+        user_msg = PROMPTS["answer_synthesize_user"].format(
+            context=context, question=question, valid_sources=valid_sources
+        )
         try:
             response = ollama.chat(
                 model=self.model,
@@ -537,9 +542,9 @@ class LocalContextRAG:
             raw_content = response.message.content or ""
         except Exception as e:
             logger.error("Ollama answer call failed: %s", e)
-            return None
+            return (None, "")
         parsed = self._safe_parse_answer(raw_content)
-        return parsed
+        return (parsed, raw_content)
 
 
 def main() -> None:
@@ -561,7 +566,7 @@ def main() -> None:
         if len(sys.argv) < 3:
             print("Usage: python local_context_rag.py ask \"Your question?\"")
             sys.exit(1)
-        result = rag.ask_question(sys.argv[2])
+        result, _raw = rag.ask_question(sys.argv[2])
         if result is not None:
             print("Answer:\n")
             print(result.answer)

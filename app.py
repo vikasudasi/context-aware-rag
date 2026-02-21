@@ -82,14 +82,15 @@ def main() -> None:
                 st.error("RAG not available. Check Settings.")
             else:
                 try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                        tmp.write(uploaded.getvalue())
-                        tmp_path = tmp.name
+                    # Save with original filename so citations show the real PDF name
+                    original_name = Path(uploaded.name).name or "uploaded.pdf"
+                    tmp_path = Path(tempfile.gettempdir()) / original_name
+                    tmp_path.write_bytes(uploaded.getvalue())
                     try:
                         rag.ingest_document(tmp_path)
                         st.success("PDF ingested successfully.")
                     finally:
-                        Path(tmp_path).unlink(missing_ok=True)
+                        tmp_path.unlink(missing_ok=True)
                 except Exception as e:
                     st.error(f"Ingestion failed: {e}")
 
@@ -102,7 +103,8 @@ def main() -> None:
                 st.error("RAG not available. Check Settings.")
             else:
                 with st.spinner("Generating answer..."):
-                    result = rag.ask_question(question.strip())
+                    ret = rag.ask_question(question.strip())
+                result, raw_response = (ret[0], ret[1]) if isinstance(ret, tuple) else (ret, "")
                 if result is not None:
                     st.subheader("Answer")
                     st.markdown(result.answer)
@@ -113,8 +115,16 @@ def main() -> None:
                                 st.caption(c.quote[:500] + ("..." if len(c.quote) > 500 else ""))
                     else:
                         st.caption("(No citations returned.)")
+                    with st.expander("Raw response (from script)"):
+                        raw_display = raw_response.strip() if raw_response else ""
+                        if not raw_display and result is not None:
+                            raw_display = result.model_dump_json(indent=2)
+                        st.code(raw_display or "(empty)", language="json")
                 else:
                     st.error("Failed to generate answer.")
+                    if raw_response:
+                        with st.expander("Raw response (from script)"):
+                            st.code(raw_response, language="json")
 
     with tab_kb:
         st.header("Knowledge Base")
