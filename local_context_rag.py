@@ -64,10 +64,10 @@ Each query should be a short, specific phrase (3-10 words) targeting different a
 User question: {question}
 
 Generate exactly 3 vector search queries (as a JSON object with key "queries", list of 3 strings). No other text.""",
-    "answer_synthesize_system": """You are a precise assistant. Answer the user's question using ONLY the provided context. Each context block is labeled with [Source: filename]. You must cite sources using ONLY the exact source filenames that are listed as "Valid source filenames" in the user message—do not invent or use any other filenames. In the "citations" array, use only those exact strings for "source". Do not invent facts. Keep the answer concise and grounded in the context. Output only valid JSON matching the schema: "answer" (string) and "citations" (list of {"source": "filename", "quote": "short excerpt"}).""",
+    "answer_synthesize_system": """You are a precise assistant. Answer the user's question using ONLY the provided context. Each context block is labeled with [Source: filename | Section: h1 > h2 > h3] so you know which document and which section the text came from. You must cite sources using ONLY the exact source filenames that are listed as "Valid source filenames" in the user message—do not invent or use any other filenames. In the "citations" array, use only those exact strings for "source". Do not invent facts. Keep the answer concise and grounded in the context. Output only valid JSON matching the schema: "answer" (string) and "citations" (list of {"source": "filename", "quote": "short excerpt"}).""",
     "answer_synthesize_user": """Valid source filenames (use ONLY these exact strings in citations, no others): {valid_sources}
 
-Context from the knowledge base (each block is labeled with its source file):
+Context from the knowledge base (each block is labeled with source file and section path):
 ---
 {context}
 ---
@@ -170,6 +170,16 @@ def _chroma_safe_metadata(metadata: dict[str, Any]) -> dict[str, str | int | flo
     return out
 
 
+def _section_label(meta: dict[str, Any]) -> str:
+    """Build a section path from header metadata (h1, h2, h3) for context labels."""
+    parts = []
+    for key in ("h1", "h2", "h3"):
+        v = meta.get(key)
+        if v is not None and str(v).strip():
+            parts.append(str(v).strip())
+    return " > ".join(parts) if parts else "—"
+
+
 class LocalContextRAG:
     """
     Local, global-context-aware RAG: ingest PDFs (with OCR) and answer questions
@@ -214,11 +224,11 @@ class LocalContextRAG:
     def _rerank_chunks(
         self,
         question: str,
-        chunks_with_sources: list[tuple[str, str]],
+        chunks_with_sources: list[tuple[str, str, dict[str, Any]]],
         top_k: int = RERANK_TOP_K,
-    ) -> list[tuple[str, str]]:
+    ) -> list[tuple[str, str, dict[str, Any]]]:
         """
-        Rerank (text, source) chunks by relevance to the question using a cross-encoder.
+        Rerank (text, source, meta) chunks by relevance to the question using a cross-encoder.
         Returns the top_k chunks in descending score order. If cross-encoder is not
         available, returns the first top_k chunks unchanged.
         """
@@ -228,7 +238,7 @@ class LocalContextRAG:
         if model is None:
             logger.warning("Reranking skipped (sentence_transformers not installed); using first %d chunks.", top_k)
             return chunks_with_sources[:top_k]
-        pairs = [(question, text) for text, _ in chunks_with_sources]
+        pairs = [(question, text) for text, _s, _m in chunks_with_sources]
         scores = model.predict(pairs)
         indexed = list(zip(scores, chunks_with_sources))
         indexed.sort(key=lambda x: x[0], reverse=True)
@@ -662,7 +672,7 @@ class LocalContextRAG:
         # 3) Retrieve more chunks (then rerank to top K)
         n_results_per_query = max(N_QUERY_RESULTS, (RETRIEVE_K + 2) // 3)
         seen_ids: set[str] = set()
-        chunks_with_sources: list[tuple[str, str]] = []  # (doc_text, source_filename)
+        chunks_with_sources: list[tuple[str, str, dict[str, Any]]] = []  # (doc_text, source_filename, meta)
         for q in search_queries.queries:
             try:
                 result = self._collection.query(
@@ -689,15 +699,16 @@ class LocalContextRAG:
                 raw_source = meta.get("source")
                 source = str(raw_source).strip() if raw_source is not None and str(raw_source).strip() else "unknown"
                 seen_ids.add(doc_id)
-                chunks_with_sources.append((doc_text, source))
+                chunks_with_sources.append((doc_text, source, meta))
         # Rerank with cross-encoder and take top K
         chunks_with_sources = self._rerank_chunks(question, chunks_with_sources, top_k=RERANK_TOP_K)
-        # Build context with source labels so the model can cite
+        # Build context with source and section (header path) so the model can cite and use structure
         context_parts = [
-            f"[Source: {source}]\n{text}" for text, source in chunks_with_sources
+            f"[Source: {source} | Section: {_section_label(meta)}]\n{text}"
+            for text, source, meta in chunks_with_sources
         ]
         context = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant context found."
-        valid_sources = ", ".join(sorted({source for _, source in chunks_with_sources}))
+        valid_sources = ", ".join(sorted({source for _t, source, _m in chunks_with_sources}))
 
         # 4) Structured answer with citations (non-streaming for JSON)
         user_msg = PROMPTS["answer_synthesize_user"].format(
