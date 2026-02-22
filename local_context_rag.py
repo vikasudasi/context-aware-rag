@@ -39,23 +39,24 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 PROMPTS = {
-    "knowledge_extract_system": """You are a precise knowledge extractor. Given document content in markdown, you must output a JSON object with exactly two keys: "glossary" and "topic_index".
+    "knowledge_extract_system": """You are a precise knowledge extractor. Given document content in markdown, you must output a JSON object with exactly three keys: "glossary", "topic_index", and "domain_rules".
 
 - "glossary": list of objects, each with "term" (string) and "definition" (string). Extract key terms and their definitions from the document.
 - "topic_index": list of strings. List the main topics or section themes in order of appearance.
+- "domain_rules": list of strings. Extract domain rules that should apply when answering questions from this material. Include rules that help an expert in this domain: how to phrase search queries (terminology, key concepts to target), how to reason (what to consider first, what not to assume), how to structure answers (what to include, order, caveats), and terminology/citation constraints (e.g. cite policy numbers, use specific units). Each rule should be one short, actionable sentence.
 
 Output only valid JSON matching the schema. No markdown, no explanation.""",
-    "knowledge_extract_user": """Extract a structured glossary and topic index from the following document content. Output valid JSON only.
+    "knowledge_extract_user": """Extract a structured glossary, topic index, and domain rules from the following document content. Output valid JSON only.
 
 Document content (markdown):
 ---
 {markdown_preview}
 ---
 
-Use the exact JSON schema: glossary (list of {{"term": "...", "definition": "..."}}), topic_index (list of topic strings).""",
-    "query_expand_system": """You are a search query expander. Given a knowledge base summary (glossary and topic index) and a user question, you must output exactly 3 different search queries that would find relevant passages in a vector database.
+Use the exact JSON schema: glossary (list of {{"term": "...", "definition": "..."}}), topic_index (list of topic strings), domain_rules (list of rule strings).""",
+    "query_expand_system": """You are a search query expander. Given a knowledge base (glossary, topic index, and domain rules) and a user question, you must output exactly 3 different search queries that would find relevant passages in a vector database.
 
-Each query should be a short, specific phrase (3-10 words) targeting different aspects: one conceptual, one keyword-focused, one rephrased. Output only valid JSON with a single key "queries" whose value is a list of exactly 3 strings.""",
+Use the domain rules and glossary to phrase expert-like queries: use domain terminology, target the right concepts, and follow any query-related guidance. Each query should be a short, specific phrase (3-10 words) targeting different aspects: one conceptual, one keyword-focused, one rephrased. Output only valid JSON with a single key "queries" whose value is a list of exactly 3 strings.""",
     "query_expand_user": """Knowledge base summary:
 ---
 {knowledge_content}
@@ -64,7 +65,12 @@ Each query should be a short, specific phrase (3-10 words) targeting different a
 User question: {question}
 
 Generate exactly 3 vector search queries (as a JSON object with key "queries", list of 3 strings). No other text.""",
-    "answer_synthesize_system": """You are a precise assistant. Answer the user's question using ONLY the provided context. Each context block is labeled with [Source: filename | Section: h1 > h2 > h3] so you know which document and which section the text came from. You must cite sources using ONLY the exact source filenames that are listed as "Valid source filenames" in the user message—do not invent or use any other filenames. In the "citations" array, use only those exact strings for "source". Do not invent facts. Keep the answer concise and grounded in the context. Output only valid JSON matching the schema: "answer" (string) and "citations" (list of {"source": "filename", "quote": "short excerpt"}).""",
+    "answer_synthesize_system": """You are a precise assistant. Answer the user's question using ONLY the provided context. Follow these domain rules when reasoning and structuring your answer:
+---
+{domain_rules}
+---
+
+Each context block is labeled with [Source: filename | Section: h1 > h2 > h3]. You must cite sources using ONLY the exact source filenames listed as "Valid source filenames" in the user message—do not invent or use any other filenames. In the "citations" array, use only those exact strings for "source". Do not invent facts. Keep the answer concise and grounded in the context. Output only valid JSON: "answer" (string) and "citations" (list of {{"source": "filename", "quote": "short excerpt"}}).""",
     "answer_synthesize_user": """Valid source filenames (use ONLY these exact strings in citations, no others): {valid_sources}
 
 Context from the knowledge base (each block is labeled with source file and section path):
@@ -75,13 +81,13 @@ Context from the knowledge base (each block is labeled with source file and sect
 User question: {question}
 
 Provide your response as JSON only: "answer" (full answer text, citing sources by filename where relevant), "citations" (list of objects with "source" = one of the valid filenames above and "quote" = a short excerpt from that source that supports the answer). Do not use any source name that is not in the valid list.""",
-    "knowledge_compact_system": """You are a knowledge compactor. Given a knowledge base (glossary and topic index), you must output a JSON object with exactly two keys: "glossary" and "topic_index".
+    "knowledge_compact_system": """You are a knowledge compactor. Given a knowledge base (glossary, topic index, and domain rules), you must output a JSON object with exactly three keys: "glossary", "topic_index", and "domain_rules".
 
-Your goal is to keep only what is essential for understanding the corpus and for rewriting user questions into good vector-search queries. You must:
-- Deduplicate: merge terms/topics that mean the same thing; keep one canonical form.
-- Prioritize: keep domain-specific terms and central concepts; drop generic or redundant entries.
-- Compress: shorten every definition to at most one clear sentence.
-- Keep the topic_index as a concise list of high-level topics (merge overlapping topics).
+Your goal is to keep only what is essential for understanding the corpus, for rewriting user questions into good vector-search queries, and for expert-like answering. You must:
+- Deduplicate: merge terms/topics/rules that mean the same thing; keep one canonical form.
+- Prioritize: keep domain-specific terms, central concepts, and the most important domain rules (query guidance, reasoning, answer structure, citation/terminology).
+- Compress: shorten every definition to at most one clear sentence; keep domain rules as short actionable sentences.
+- Keep the topic_index as a concise list of high-level topics and domain_rules as a concise list of rule strings.
 
 Output only valid JSON matching the schema. The total output must stay well under the requested character limit. No markdown, no explanation.""",
     "knowledge_compact_user": """Current knowledge base (may be truncated):
@@ -89,7 +95,7 @@ Output only valid JSON matching the schema. The total output must stay well unde
 {knowledge_preview}
 ---
 
-Produce a condensed glossary and topic index as JSON. Keep only essential terms and topics. Each definition must be one sentence. Output valid JSON only: glossary (list of {{"term": "...", "definition": "..."}}), topic_index (list of topic strings).""",
+Produce a condensed glossary, topic index, and domain rules as JSON. Keep only essential terms, topics, and rules. Each definition must be one sentence; each domain rule one short sentence. Output valid JSON only: glossary (list of {{"term": "...", "definition": "..."}}), topic_index (list of topic strings), domain_rules (list of rule strings).""",
 }
 
 # -----------------------------------------------------------------------------
@@ -105,10 +111,11 @@ class GlossaryEntry(BaseModel):
 
 
 class KnowledgeSchema(BaseModel):
-    """Structured output for knowledge extraction: glossary and topic index."""
+    """Structured output for knowledge extraction: glossary, topic index, and domain rules."""
 
     glossary: list[GlossaryEntry] = Field(default_factory=list)
     topic_index: list[str] = Field(default_factory=list)
+    domain_rules: list[str] = Field(default_factory=list)
 
 
 class SearchQueries(BaseModel):
@@ -141,7 +148,12 @@ DEFAULT_COLLECTION_NAME = "rag_chunks"
 DEFAULT_MODEL = "llama3.2"
 KNOWLEDGE_MARKDOWN_HEADER = "# Knowledge\n\n## Glossary\n\n"
 KNOWLEDGE_TOPIC_HEADER = "\n## Topic Index\n\n"
-DEFAULT_KNOWLEDGE_CONTENT = KNOWLEDGE_MARKDOWN_HEADER + "(empty)\n" + KNOWLEDGE_TOPIC_HEADER + "(empty)\n"
+KNOWLEDGE_DOMAIN_RULES_HEADER = "\n## Domain rules\n\n"
+DEFAULT_KNOWLEDGE_CONTENT = (
+    KNOWLEDGE_MARKDOWN_HEADER + "(empty)\n"
+    + KNOWLEDGE_TOPIC_HEADER + "(empty)\n"
+    + KNOWLEDGE_DOMAIN_RULES_HEADER + "(empty)\n"
+)
 MAX_MARKDOWN_FOR_KNOWLEDGE = 12000  # chars per window sent to LLM for knowledge extraction
 KNOWLEDGE_WINDOW_OVERLAP = 500      # overlap between consecutive extraction windows
 # 50% of 128K context: ~64K tokens * 4 chars/token ≈ 256K chars
@@ -255,24 +267,73 @@ class LocalContextRAG:
             return DEFAULT_KNOWLEDGE_CONTENT
         return self.knowledge_path.read_text(encoding="utf-8")
 
+    def _get_domain_rules_text(self, knowledge_content: str) -> str:
+        """
+        Extract the Domain rules section body from knowledge.md content for use in prompts.
+        :return: The rules section text, or "None specified." if missing or empty.
+        """
+        marker = "## Domain rules"
+        idx = knowledge_content.find(marker)
+        if idx == -1:
+            return "None specified."
+        start = idx + len(marker)
+        rest = knowledge_content[start:]
+        # Stop at next ## header
+        next_h2 = rest.find("\n## ")
+        body = rest[:next_h2].strip() if next_h2 != -1 else rest.strip()
+        if not body or body.lower() == "(empty)":
+            return "None specified."
+        return body
+
     def _merge_knowledge(self, parsed: KnowledgeSchema) -> None:
         """
-        Merge parsed glossary and topic_index into existing knowledge.md.
-        Appends new entries to the Glossary and Topic Index sections.
+        Merge parsed glossary, topic_index, and domain_rules into existing knowledge.md.
+        Appends new entries to each section; deduplicates by normalized text.
         """
         content = self._ensure_knowledge_file()
+        glossary_marker = "## Glossary"
+        topic_marker = "## Topic Index"
+        rules_marker = "## Domain rules"
+        idx_glossary = content.find(glossary_marker)
+        idx_topic = content.find(topic_marker)
+        idx_rules = content.find(rules_marker)
 
-        # Parse existing terms/topics to avoid duplicates
+        # Section bounds: from this section's header until the next ## or end
+        end_glossary = idx_topic if idx_topic != -1 else (idx_rules if idx_rules != -1 else len(content))
+        if idx_topic != -1:
+            end_glossary = min(end_glossary, idx_topic)
+        end_topic = idx_rules if idx_rules != -1 else len(content)
+        if idx_rules != -1:
+            end_topic = min(end_topic, idx_rules)
+        # Body = content after the header line (so we don't include "## X" in parsed bullets)
+        def body_after(section_start: int, section_end: int, header: str) -> str:
+            if section_start == -1:
+                return ""
+            start = section_start + len(header)
+            return content[start:section_end].strip()
+
+        glossary_body = body_after(idx_glossary, end_glossary, glossary_marker) if idx_glossary != -1 else ""
+        topic_body = body_after(idx_topic, end_topic, topic_marker) if idx_topic != -1 else ""
+        rules_body = body_after(idx_rules, len(content), rules_marker) if idx_rules != -1 else ""
+
+        # Parse existing items from each section only (so topic vs rule bullets don't mix)
         existing_terms: set[str] = set()
-        existing_topics: set[str] = set()
-        for line in content.split("\n"):
+        for line in glossary_body.split("\n"):
             m = re.match(r"^- \*\*(.+?)\*\*:", line)
             if m:
                 existing_terms.add(m.group(1).lower().strip())
-            elif line.startswith("- ") and "**" not in line:
-                existing_topics.add(line[2:].lower().strip())
 
-        # Build new glossary lines and topic lines (skip duplicates)
+        existing_topics: set[str] = set()
+        for line in topic_body.split("\n"):
+            if line.startswith("- ") and "**" not in line:
+                existing_topics.add(line[2:].strip().lower())
+
+        existing_rules: set[str] = set()
+        for line in rules_body.split("\n"):
+            if line.startswith("- "):
+                existing_rules.add(line[2:].strip().lower())
+
+        # Build new lines (skip duplicates)
         new_glossary_lines = []
         for e in parsed.glossary:
             if e.term.lower().strip() not in existing_terms:
@@ -281,32 +342,38 @@ class LocalContextRAG:
         for t in parsed.topic_index:
             if t.lower().strip() not in existing_topics:
                 new_topic_lines.append(f"- {t}")
+        new_rule_lines = []
+        for r in parsed.domain_rules:
+            key = r.strip().lower()
+            if key and key not in existing_rules:
+                new_rule_lines.append(f"- {r.strip()}")
 
-        # Parse existing sections (simple: find ## Glossary and ## Topic Index)
-        glossary_marker = "## Glossary"
-        topic_marker = "## Topic Index"
-        idx_glossary = content.find(glossary_marker)
-        idx_topic = content.find(topic_marker)
-
+        # Build sections (keep existing body, append new)
         if idx_glossary == -1:
-            glossary_section = glossary_marker + "\n\n" + "\n".join(new_glossary_lines) if new_glossary_lines else glossary_marker + "\n\n(empty)\n"
+            glossary_section = glossary_marker + "\n\n" + ("\n".join(new_glossary_lines) if new_glossary_lines else "(empty)\n")
         else:
-            # Take content from Glossary to Topic Index (or end)
-            end_glossary = idx_topic if idx_topic != -1 else len(content)
-            existing_glossary = content[idx_glossary:end_glossary].strip()
+            existing_glossary = glossary_body
             if new_glossary_lines:
                 existing_glossary += "\n\n" + "\n".join(new_glossary_lines)
-            glossary_section = existing_glossary
+            glossary_section = glossary_marker + "\n\n" + existing_glossary
 
         if idx_topic == -1:
-            topic_section = topic_marker + "\n\n" + "\n".join(new_topic_lines) if new_topic_lines else topic_marker + "\n\n(empty)\n"
+            topic_section = topic_marker + "\n\n" + ("\n".join(new_topic_lines) if new_topic_lines else "(empty)\n")
         else:
-            existing_topic = content[idx_topic:].strip()
+            existing_topic = topic_body
             if new_topic_lines:
                 existing_topic += "\n\n" + "\n".join(new_topic_lines)
-            topic_section = existing_topic
+            topic_section = topic_marker + "\n\n" + existing_topic
 
-        new_content = "# Knowledge\n\n" + glossary_section + "\n\n" + topic_section + "\n"
+        if idx_rules == -1:
+            rules_section = rules_marker + "\n\n" + ("\n".join(new_rule_lines) if new_rule_lines else "(empty)\n")
+        else:
+            existing_rules_content = rules_body
+            if new_rule_lines:
+                existing_rules_content += "\n\n" + "\n".join(new_rule_lines)
+            rules_section = rules_marker + "\n\n" + existing_rules_content
+
+        new_content = "# Knowledge\n\n" + glossary_section + "\n\n" + topic_section + "\n\n" + rules_section + "\n"
         self.knowledge_path.write_text(new_content, encoding="utf-8")
         if len(new_content) >= THRESHOLD_KNOWLEDGE_CHARS:
             self._compact_knowledge()
@@ -358,8 +425,10 @@ class LocalContextRAG:
             )
             all_glossary: list[GlossaryEntry] = []
             all_topics: list[str] = []
+            all_rules: list[str] = []
             seen_terms: set[str] = set()
             seen_topics: set[str] = set()
+            seen_rules: set[str] = set()
             step = MAX_KNOWLEDGE_FOR_COMPACT - KNOWLEDGE_WINDOW_OVERLAP
             for start in range(0, len(content), step):
                 window = content[start : start + MAX_KNOWLEDGE_FOR_COMPACT]
@@ -376,21 +445,29 @@ class LocalContextRAG:
                     if key and key not in seen_topics:
                         seen_topics.add(key)
                         all_topics.append(t)
-            parsed = KnowledgeSchema(glossary=all_glossary, topic_index=all_topics) if (all_glossary or all_topics) else None
+                for r in (result.domain_rules or []):
+                    key = r.strip().lower()
+                    if key and key not in seen_rules:
+                        seen_rules.add(key)
+                        all_rules.append(r.strip())
+            parsed = KnowledgeSchema(glossary=all_glossary, topic_index=all_topics, domain_rules=all_rules) if (all_glossary or all_topics or all_rules) else None
 
         if parsed is None:
             logger.warning("Compaction parse failed; knowledge.md unchanged.")
             return
         glossary_lines = [f"- **{e.term}**: {e.definition}" for e in parsed.glossary]
         topic_lines = [f"- {t}" for t in parsed.topic_index]
+        rule_lines = [f"- {r}" for r in (parsed.domain_rules or [])]
         glossary_section = "## Glossary\n\n" + ("\n".join(glossary_lines) if glossary_lines else "(empty)")
         topic_section = "## Topic Index\n\n" + ("\n".join(topic_lines) if topic_lines else "(empty)")
-        new_content = "# Knowledge\n\n" + glossary_section + "\n\n" + topic_section + "\n"
+        rules_section = "## Domain rules\n\n" + ("\n".join(rule_lines) if rule_lines else "(empty)")
+        new_content = "# Knowledge\n\n" + glossary_section + "\n\n" + topic_section + "\n\n" + rules_section + "\n"
         self.knowledge_path.write_text(new_content, encoding="utf-8")
         logger.info(
-            "Compacted knowledge.md: %d glossary entries, %d topics (%d chars).",
+            "Compacted knowledge.md: %d glossary entries, %d topics, %d domain rules (%d chars).",
             len(parsed.glossary),
             len(parsed.topic_index),
+            len(parsed.domain_rules or []),
             len(new_content),
         )
 
@@ -429,12 +506,14 @@ class LocalContextRAG:
         """
         Extract a unified KnowledgeSchema from the full markdown by sliding a window
         of MAX_MARKDOWN_FOR_KNOWLEDGE chars with KNOWLEDGE_WINDOW_OVERLAP overlap.
-        Deduplicates glossary terms and topics across all windows.
+        Deduplicates glossary terms, topics, and domain rules across all windows.
         """
         all_glossary: list[GlossaryEntry] = []
         all_topics: list[str] = []
+        all_rules: list[str] = []
         seen_terms: set[str] = set()
         seen_topics: set[str] = set()
+        seen_rules: set[str] = set()
 
         step = MAX_MARKDOWN_FOR_KNOWLEDGE - KNOWLEDGE_WINDOW_OVERLAP
         total = len(md)
@@ -457,14 +536,20 @@ class LocalContextRAG:
                 if key and key not in seen_topics:
                     seen_topics.add(key)
                     all_topics.append(topic)
+            for r in getattr(parsed, "domain_rules", []) or []:
+                key = r.strip().lower()
+                if key and key not in seen_rules:
+                    seen_rules.add(key)
+                    all_rules.append(r.strip())
 
         logger.info(
-            "Knowledge extraction complete: %d windows, %d terms, %d topics.",
+            "Knowledge extraction complete: %d windows, %d terms, %d topics, %d domain rules.",
             window_count,
             len(all_glossary),
             len(all_topics),
+            len(all_rules),
         )
-        return KnowledgeSchema(glossary=all_glossary, topic_index=all_topics)
+        return KnowledgeSchema(glossary=all_glossary, topic_index=all_topics, domain_rules=all_rules)
 
     def _safe_parse_search_queries(self, raw: str, fallback_query: str) -> SearchQueries:
         """Parse LLM response into SearchQueries; on failure return fallback (same query 3 times)."""
@@ -590,9 +675,14 @@ class LocalContextRAG:
         # 4) Update knowledge.md via Ollama (full-document multi-window extraction)
         logger.info("Extracting knowledge from full document (%d chars) via sliding window.", len(md))
         parsed = self._extract_all_knowledge(md)
-        if parsed.glossary or parsed.topic_index:
+        if parsed.glossary or parsed.topic_index or getattr(parsed, "domain_rules", None):
             self._merge_knowledge(parsed)
-            logger.info("Merged knowledge (glossary=%d, topics=%d).", len(parsed.glossary), len(parsed.topic_index))
+            logger.info(
+                "Merged knowledge (glossary=%d, topics=%d, domain_rules=%d).",
+                len(parsed.glossary),
+                len(parsed.topic_index),
+                len(getattr(parsed, "domain_rules", []) or []),
+            )
         else:
             logger.warning("Skipped knowledge merge: no entries extracted from document.")
 
@@ -710,7 +800,9 @@ class LocalContextRAG:
         context = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant context found."
         valid_sources = ", ".join(sorted({source for _t, source, _m in chunks_with_sources}))
 
-        # 4) Structured answer with citations (non-streaming for JSON)
+        # 4) Structured answer with citations (non-streaming for JSON); inject domain rules into system
+        domain_rules_text = self._get_domain_rules_text(knowledge_content)
+        answer_system = PROMPTS["answer_synthesize_system"].replace("{domain_rules}", domain_rules_text)
         user_msg = PROMPTS["answer_synthesize_user"].format(
             context=context, question=question, valid_sources=valid_sources
         )
@@ -718,7 +810,7 @@ class LocalContextRAG:
             response = ollama.chat(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": PROMPTS["answer_synthesize_system"]},
+                    {"role": "system", "content": answer_system},
                     {"role": "user", "content": user_msg},
                 ],
                 format=AnswerWithCitations.model_json_schema(),
