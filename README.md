@@ -13,7 +13,7 @@ A **local** RAG system that ingests PDFs (including scanned/image-only via OCR),
 ## Features
 
 - **Ingestion**: PDF → Markdown (with OCR when needed) → header-based chunks → ChromaDB upsert; Ollama extracts glossary and topic index into `knowledge.md`.
-- **Query**: Read `knowledge.md` → Ollama generates 3 vector-search queries → ChromaDB retrieval → dedupe → Ollama streams the final answer.
+- **Query**: Read `knowledge.md` → Ollama generates 3 vector-search queries → ChromaDB retrieval (top ~50) → **cross-encoder rerank** (top 15) → dedupe → Ollama for final answer with citations.
 - **Knowledge compaction**: When `knowledge.md` reaches ~50% of a 128K-token context (≈256K chars), Ollama compacts it: deduplicate terms/topics, shorten definitions, keep only what’s essential for query expansion. Runs after merge and before query so the file stays within context.
 
 ## Requirements

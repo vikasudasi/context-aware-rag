@@ -24,6 +24,13 @@ import chromadb
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field
 
+try:
+    from sentence_transformers import CrossEncoder
+    _CROSS_ENCODER_AVAILABLE = True
+except ImportError:
+    CrossEncoder = None  # type: ignore[misc, assignment]
+    _CROSS_ENCODER_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -141,6 +148,10 @@ KNOWLEDGE_WINDOW_OVERLAP = 500      # overlap between consecutive extraction win
 THRESHOLD_KNOWLEDGE_CHARS = 256000
 MAX_KNOWLEDGE_FOR_COMPACT = 80000  # max chars per compaction window sent to LLM
 N_QUERY_RESULTS = 8
+# Reranking: retrieve more, then cross-encoder rerank and take top K
+RETRIEVE_K = 50          # total chunks to retrieve (before rerank); n_results per query = ceil(RETRIEVE_K/3)
+RERANK_TOP_K = 15        # chunks to keep after reranking
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
 MAX_CHUNK_SIZE = 1500   # max chars per vector-store chunk (secondary splitter)
 CHUNK_OVERLAP = 150     # overlap for RecursiveCharacterTextSplitter
 PDF_PAGE_BATCH_SIZE = 50  # pages per batch for converting large PDFs
@@ -189,6 +200,39 @@ class LocalContextRAG:
             name=self.collection_name,
             metadata={"description": "RAG chunks from ingested PDFs"},
         )
+        self._reranker: Any = None
+
+    def _get_reranker(self) -> Any:
+        """Lazy-load the cross-encoder model for reranking (if sentence_transformers is installed)."""
+        if not _CROSS_ENCODER_AVAILABLE or CrossEncoder is None:
+            return None
+        if self._reranker is None:
+            logger.info("Loading cross-encoder for reranking: %s", CROSS_ENCODER_MODEL)
+            self._reranker = CrossEncoder(CROSS_ENCODER_MODEL)
+        return self._reranker
+
+    def _rerank_chunks(
+        self,
+        question: str,
+        chunks_with_sources: list[tuple[str, str]],
+        top_k: int = RERANK_TOP_K,
+    ) -> list[tuple[str, str]]:
+        """
+        Rerank (text, source) chunks by relevance to the question using a cross-encoder.
+        Returns the top_k chunks in descending score order. If cross-encoder is not
+        available, returns the first top_k chunks unchanged.
+        """
+        if not chunks_with_sources or len(chunks_with_sources) <= top_k:
+            return chunks_with_sources
+        model = self._get_reranker()
+        if model is None:
+            logger.warning("Reranking skipped (sentence_transformers not installed); using first %d chunks.", top_k)
+            return chunks_with_sources[:top_k]
+        pairs = [(question, text) for text, _ in chunks_with_sources]
+        scores = model.predict(pairs)
+        indexed = list(zip(scores, chunks_with_sources))
+        indexed.sort(key=lambda x: x[0], reverse=True)
+        return [chunk for _, chunk in indexed[:top_k]]
 
     def _ensure_knowledge_file(self) -> str:
         """
@@ -615,14 +659,15 @@ class LocalContextRAG:
             raw = ""
         search_queries = self._safe_parse_search_queries(raw, question)
 
-        # 3) Retrieve and dedupe (keep source per chunk for citations)
+        # 3) Retrieve more chunks (then rerank to top K)
+        n_results_per_query = max(N_QUERY_RESULTS, (RETRIEVE_K + 2) // 3)
         seen_ids: set[str] = set()
         chunks_with_sources: list[tuple[str, str]] = []  # (doc_text, source_filename)
         for q in search_queries.queries:
             try:
                 result = self._collection.query(
                     query_texts=[q],
-                    n_results=N_QUERY_RESULTS,
+                    n_results=n_results_per_query,
                     include=["documents", "metadatas"],
                 )
             except Exception as e:
@@ -645,6 +690,8 @@ class LocalContextRAG:
                 source = str(raw_source).strip() if raw_source is not None and str(raw_source).strip() else "unknown"
                 seen_ids.add(doc_id)
                 chunks_with_sources.append((doc_text, source))
+        # Rerank with cross-encoder and take top K
+        chunks_with_sources = self._rerank_chunks(question, chunks_with_sources, top_k=RERANK_TOP_K)
         # Build context with source labels so the model can cite
         context_parts = [
             f"[Source: {source}]\n{text}" for text, source in chunks_with_sources
