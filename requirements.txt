@@ -11,5 +11,10 @@ pydantic>=2.0.0
 streamlit>=1.28.0
 sentence-transformers>=2.2.0
 
-# Optional: improves OCR heuristics for scanned PDFs (OpenCV)
+# Enhanced OCR pipeline for scanned / image-heavy PDFs
+# opencv-python: image preprocessing (denoise, binarize, deskew) — already listed above
 opencv-python>=4.8.0
+# pytesseract: Python wrapper for Tesseract; enables OEM 3 (LSTM) + PSM 3 config
+pytesseract>=0.3.10
+# Pillow: required by pytesseract for image I/O
+Pillow>=9.0.0
