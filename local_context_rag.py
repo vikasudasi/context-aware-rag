@@ -170,6 +170,8 @@ CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
 MAX_CHUNK_SIZE = 1500   # max chars per vector-store chunk (secondary splitter)
 CHUNK_OVERLAP = 150     # overlap for RecursiveCharacterTextSplitter
 PDF_PAGE_BATCH_SIZE = 50  # pages per batch for converting large PDFs
+# OCR language(s) for scanned PDFs (Tesseract codes; only used when pymupdf.layout is imported)
+OCR_LANGUAGE = "eng+hin"  # English + Hindi (install Tesseract hin data for Hindi)
 
 
 def _chroma_safe_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
@@ -656,7 +658,7 @@ class LocalContextRAG:
             try:
                 total_pages = len(doc)
                 if total_pages <= PDF_PAGE_BATCH_SIZE:
-                    md = pymupdf4llm.to_markdown(doc)
+                    md = pymupdf4llm.to_markdown(doc, ocr_language=OCR_LANGUAGE)
                 else:
                     logger.info(
                         "Large PDF (%d pages); converting in batches of %d.",
@@ -667,7 +669,7 @@ class LocalContextRAG:
                     for start in range(0, total_pages, PDF_PAGE_BATCH_SIZE):
                         end = min(start + PDF_PAGE_BATCH_SIZE, total_pages)
                         batch_pages = list(range(start, end))
-                        parts.append(pymupdf4llm.to_markdown(doc, pages=batch_pages))
+                        parts.append(pymupdf4llm.to_markdown(doc, pages=batch_pages, ocr_language=OCR_LANGUAGE))
                     md = "\n\n".join(parts)
             finally:
                 doc.close()

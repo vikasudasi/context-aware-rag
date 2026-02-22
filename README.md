@@ -22,7 +22,7 @@ A **local** RAG system that ingests PDFs (including scanned/image-only via OCR),
 ## Requirements
 
 - **Python 3.10+**
-- **Tesseract** installed on your system (for OCR of scanned PDFs)
+- **Tesseract** installed on your system (for OCR of scanned PDFs). OCR is set to **English + Hindi** (`eng+hin`); for scanned Hindi PDFs, install Tesseract Hindi data (e.g. `tessdata` for `hin`).
 - **Ollama** running locally with a model such as `llama3.2` (`ollama pull llama3.2`)
 
 ## Install
