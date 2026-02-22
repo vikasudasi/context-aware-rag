@@ -163,6 +163,9 @@ N_QUERY_RESULTS = 8
 # Reranking: retrieve more, then cross-encoder rerank and take top K
 RETRIEVE_K = 50          # total chunks to retrieve (before rerank); n_results per query = ceil(RETRIEVE_K/3)
 RERANK_TOP_K = 15        # chunks to keep after reranking
+TOP_N_FOR_PARENTS = 5     # only resolve parent for top N chunks (good parent-to-child ratio)
+PARENT_MIN_CHARS = 100    # only add parent to context if longer than this
+PARENT_MAX_CHARS = 500    # truncate parent to this length when adding to context
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
 MAX_CHUNK_SIZE = 1500   # max chars per vector-store chunk (secondary splitter)
 CHUNK_OVERLAP = 150     # overlap for RecursiveCharacterTextSplitter
@@ -190,6 +193,17 @@ def _section_label(meta: dict[str, Any]) -> str:
         if v is not None and str(v).strip():
             parts.append(str(v).strip())
     return " > ".join(parts) if parts else "—"
+
+
+def _chunk_index_from_meta(meta: dict[str, Any]) -> int | None:
+    """Return chunk_index from metadata as int, or None if missing/invalid."""
+    v = meta.get("chunk_index")
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 class LocalContextRAG:
@@ -255,6 +269,51 @@ class LocalContextRAG:
         indexed = list(zip(scores, chunks_with_sources))
         indexed.sort(key=lambda x: x[0], reverse=True)
         return [chunk for _, chunk in indexed[:top_k]]
+
+    def _get_parent_chunk(
+        self,
+        source: str,
+        meta: dict[str, Any],
+    ) -> tuple[str, str, dict[str, Any]] | None:
+        """
+        Resolve the section-root (parent) chunk at query time.
+        For a chunk with (h1, h2, h3), parent is the chunk with same source, h1, h2 and min chunk_index.
+        For (h1, h2), parent is the chunk with same source, h1 and min chunk_index.
+        Returns (doc_text, source, meta) or None if not found or no parent level.
+        """
+        h1 = meta.get("h1")
+        h2 = meta.get("h2")
+        if h1 is None or not str(h1).strip():
+            return None
+        where: dict[str, Any] = {"source": source, "h1": str(h1).strip()}
+        if h2 is not None and str(h2).strip():
+            where["h2"] = str(h2).strip()
+        try:
+            result = self._collection.get(
+                where=where,
+                include=["documents", "metadatas"],
+            )
+        except Exception as e:
+            logger.debug("Parent chunk lookup failed for %s: %s", where, e)
+            return None
+        ids_list = result.get("ids") or []
+        docs = result.get("documents") or []
+        metadatas = result.get("metadatas") or []
+        if not ids_list or not docs:
+            return None
+        # Chroma get returns flat lists; get first doc and meta per id
+        best_idx = 0
+        best_index = _chunk_index_from_meta(metadatas[0] if metadatas else {})
+        for i in range(1, len(ids_list)):
+            ci = _chunk_index_from_meta(metadatas[i] if i < len(metadatas) else {})
+            if ci is not None and (best_index is None or ci < best_index):
+                best_idx = i
+                best_index = ci
+        doc_text = docs[best_idx] if best_idx < len(docs) else ""
+        parent_meta = metadatas[best_idx] if best_idx < len(metadatas) else {}
+        if not doc_text:
+            return None
+        return (doc_text, source, parent_meta)
 
     def _ensure_knowledge_file(self) -> str:
         """
@@ -792,11 +851,39 @@ class LocalContextRAG:
                 chunks_with_sources.append((doc_text, source, meta))
         # Rerank with cross-encoder and take top K
         chunks_with_sources = self._rerank_chunks(question, chunks_with_sources, top_k=RERANK_TOP_K)
-        # Build context with source and section (header path) so the model can cite and use structure
+        # Build context: 15 main chunks, then parent chunks (for reference / better context mapping) for top 5 only
         context_parts = [
             f"[Source: {source} | Section: {_section_label(meta)}]\n{text}"
             for text, source, meta in chunks_with_sources
         ]
+        set_of_15 = {
+            (src, _chunk_index_from_meta(meta))
+            for _t, src, meta in chunks_with_sources
+        }
+        seen_parent_keys: set[tuple[str, str]] = set()
+        parent_blocks: list[tuple[str, str]] = []  # (section_label, truncated_text)
+        for text, source, meta in chunks_with_sources[:TOP_N_FOR_PARENTS]:
+            parent = self._get_parent_chunk(source, meta)
+            if parent is None:
+                continue
+            p_text, p_source, p_meta = parent
+            p_key = (p_source, _section_label(p_meta))
+            if p_key in seen_parent_keys:
+                continue
+            if (p_source, _chunk_index_from_meta(p_meta)) in set_of_15:
+                continue
+            if len(p_text) <= PARENT_MIN_CHARS:
+                continue
+            seen_parent_keys.add(p_key)
+            truncated = p_text if len(p_text) <= PARENT_MAX_CHARS else p_text[:PARENT_MAX_CHARS].rstrip() + "..."
+            parent_blocks.append((_section_label(p_meta), truncated))
+        if parent_blocks:
+            context_parts.append(
+                "Parent chunks (for reference / better context mapping):\n\n"
+                + "\n\n".join(
+                    f"[Section: {section}]\n{truncated}" for section, truncated in parent_blocks
+                )
+            )
         context = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant context found."
         valid_sources = ", ".join(sorted({source for _t, source, _m in chunks_with_sources}))
 
