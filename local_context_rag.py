@@ -31,6 +31,24 @@ except ImportError:
     CrossEncoder = None  # type: ignore[misc, assignment]
     _CROSS_ENCODER_AVAILABLE = False
 
+# Optional: OpenCV + pytesseract for enhanced OCR preprocessing pipeline.
+# If unavailable the enhanced fallback is silently skipped and pymupdf4llm handles OCR.
+try:
+    import cv2 as _cv2
+    import numpy as _np
+    _OPENCV_AVAILABLE = True
+except ImportError:
+    _cv2 = None  # type: ignore[assignment]
+    _np = None   # type: ignore[assignment]
+    _OPENCV_AVAILABLE = False
+
+try:
+    import pytesseract as _pytesseract
+    _PYTESSERACT_AVAILABLE = True
+except ImportError:
+    _pytesseract = None  # type: ignore[assignment]
+    _PYTESSERACT_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -172,6 +190,97 @@ CHUNK_OVERLAP = 150     # overlap for RecursiveCharacterTextSplitter
 PDF_PAGE_BATCH_SIZE = 50  # pages per batch for converting large PDFs
 # OCR language(s) for scanned PDFs (Tesseract codes; only used when pymupdf.layout is imported)
 OCR_LANGUAGE = "eng+hin"  # English + Hindi (install Tesseract hin data for Hindi)
+OCR_DPI = 300             # Render resolution for OCR; 300 DPI is the industry standard for good accuracy
+# Pages with fewer native chars AND at least one image are treated as scanned and sent through the
+# enhanced OpenCV + pytesseract pipeline in addition to pymupdf4llm.
+OCR_NATIVE_TEXT_THRESHOLD = 30
+# Tesseract engine/page-seg flags: OEM 3 = LSTM (best accuracy), PSM 3 = fully automatic layout.
+OCR_TESSERACT_CONFIG = r"--oem 3 --psm 3"
+
+
+def _preprocess_image_for_ocr(img_bgr: Any) -> Any:
+    """
+    Preprocess a BGR image to improve OCR accuracy on scanned/messy documents.
+
+    Pipeline:
+      1. Grayscale conversion
+      2. Non-local means denoising  (removes scanner noise / JPEG artefacts)
+      3. Adaptive Gaussian binarization  (handles uneven illumination / shadows)
+      4. Deskew  (corrects page rotation up to ~45 °)
+
+    Requires OpenCV (cv2) and NumPy.  Returns the preprocessed single-channel
+    image as a NumPy array.  If OpenCV is unavailable the input is returned
+    unchanged so callers can still attempt OCR on the raw image.
+    """
+    if not _OPENCV_AVAILABLE:
+        return img_bgr
+    cv2 = _cv2
+    np = _np
+    # 1. Grayscale
+    gray: Any = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # 2. Denoise — h=10 is a good balance between noise removal and detail retention
+    denoised: Any = cv2.fastNlMeansDenoising(gray, h=10)
+    # 3. Adaptive binarization — better than global threshold for uneven lighting
+    binary: Any = cv2.adaptiveThreshold(
+        denoised, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=31,
+        C=10,
+    )
+    # 4. Deskew: estimate rotation from the distribution of dark (text) pixels
+    coords: Any = np.column_stack(np.where(binary < 128))
+    if len(coords) > 100:
+        angle: float = cv2.minAreaRect(coords)[-1]
+        # minAreaRect returns angles in [-90, 0); convert to a meaningful rotation
+        angle = -(90 + angle) if angle < -45 else -angle
+        if abs(angle) > 0.3:  # skip negligible rotation
+            h, w = binary.shape
+            M: Any = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+            binary = cv2.warpAffine(
+                binary, M, (w, h),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+    return binary
+
+
+def _ocr_page_enhanced(page: Any, ocr_language: str) -> str:
+    """
+    High-quality OCR fallback for scanned / image-heavy PDF pages.
+
+    Steps:
+      1. Render the page to a pixmap at OCR_DPI (300 DPI by default).
+      2. Preprocess with :func:`_preprocess_image_for_ocr`.
+      3. Run pytesseract with OEM 3 (LSTM) + PSM 3 (auto layout detection).
+
+    Returns the extracted text, or an empty string if the enhanced pipeline
+    is unavailable (missing cv2 / pytesseract) or encounters an error.
+
+    The LSTM engine (OEM 3) is significantly more accurate than the legacy
+    engine for non-Latin scripts such as Hindi / Devanagari.
+    """
+    if not (_OPENCV_AVAILABLE and _PYTESSERACT_AVAILABLE):
+        return ""
+    try:
+        from PIL import Image as _PILImage  # Pillow is required by pytesseract
+        np = _np
+        cv2 = _cv2
+        mat = pymupdf.Matrix(OCR_DPI / 72, OCR_DPI / 72)
+        pix = page.get_pixmap(matrix=mat, colorspace=pymupdf.csRGB)
+        arr: Any = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+        img_bgr: Any = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        preprocessed = _preprocess_image_for_ocr(img_bgr)
+        pil_img = _PILImage.fromarray(preprocessed)
+        text: str = _pytesseract.image_to_string(
+            pil_img,
+            lang=ocr_language,
+            config=OCR_TESSERACT_CONFIG,
+        )
+        return text.strip()
+    except Exception as exc:
+        logger.warning("Enhanced OCR failed on page %d: %s", getattr(page, "number", "?") + 1, exc)
+        return ""
 
 
 def _chroma_safe_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
@@ -652,13 +761,18 @@ class LocalContextRAG:
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
         # 1) Parse PDF to Markdown in page batches (handles large files without full-memory load)
+        #    Primary path  : pymupdf4llm at OCR_DPI (300 DPI) with Tesseract via pymupdf.layout.
+        #    Enhanced path : for pages that contain images but yield fewer than
+        #                    OCR_NATIVE_TEXT_THRESHOLD native characters, a second pass using
+        #                    OpenCV preprocessing + pytesseract (OEM 3 LSTM) recovers text that
+        #                    the primary Tesseract pass missed (skewed scans, low contrast, etc.).
         logger.info("Parsing PDF to markdown: %s", pdf_path)
         try:
             doc = pymupdf.open(pdf_path)
             try:
                 total_pages = len(doc)
                 if total_pages <= PDF_PAGE_BATCH_SIZE:
-                    md = pymupdf4llm.to_markdown(doc, ocr_language=OCR_LANGUAGE)
+                    md = pymupdf4llm.to_markdown(doc, ocr_language=OCR_LANGUAGE, dpi=OCR_DPI)
                 else:
                     logger.info(
                         "Large PDF (%d pages); converting in batches of %d.",
@@ -669,8 +783,44 @@ class LocalContextRAG:
                     for start in range(0, total_pages, PDF_PAGE_BATCH_SIZE):
                         end = min(start + PDF_PAGE_BATCH_SIZE, total_pages)
                         batch_pages = list(range(start, end))
-                        parts.append(pymupdf4llm.to_markdown(doc, pages=batch_pages, ocr_language=OCR_LANGUAGE))
+                        parts.append(
+                            pymupdf4llm.to_markdown(
+                                doc, pages=batch_pages, ocr_language=OCR_LANGUAGE, dpi=OCR_DPI
+                            )
+                        )
                     md = "\n\n".join(parts)
+
+                # Enhanced OCR pass — identify scanned/image-heavy pages and run the
+                # OpenCV-preprocessed pytesseract pipeline on them.  The recovered text
+                # is appended only when it is meaningfully longer than the native extraction,
+                # so purely textual pages are never duplicated.
+                if _OPENCV_AVAILABLE and _PYTESSERACT_AVAILABLE:
+                    recovered: list[str] = []
+                    for pg_num in range(total_pages):
+                        pg = doc[pg_num]
+                        native_text = pg.get_text("text").strip()
+                        has_images = bool(pg.get_images(full=False))
+                        if len(native_text) < OCR_NATIVE_TEXT_THRESHOLD and has_images:
+                            enhanced = _ocr_page_enhanced(pg, OCR_LANGUAGE)
+                            # Only use the enhanced result if it recovered substantially more text
+                            if enhanced and len(enhanced) > len(native_text) + 20:
+                                recovered.append(
+                                    f"<!-- Enhanced OCR — page {pg_num + 1} -->\n\n{enhanced}"
+                                )
+                    if recovered:
+                        logger.info(
+                            "Enhanced OCR pipeline recovered text from %d scanned page(s).",
+                            len(recovered),
+                        )
+                        md = md + "\n\n" + "\n\n".join(recovered)
+                else:
+                    if not (_OPENCV_AVAILABLE and _PYTESSERACT_AVAILABLE):
+                        logger.debug(
+                            "Enhanced OCR pipeline unavailable "
+                            "(cv2=%s, pytesseract=%s); using pymupdf4llm OCR only.",
+                            _OPENCV_AVAILABLE,
+                            _PYTESSERACT_AVAILABLE,
+                        )
             finally:
                 doc.close()
         except Exception as e:
