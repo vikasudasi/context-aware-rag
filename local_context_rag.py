@@ -21,7 +21,7 @@ import pymupdf4llm
 import pymupdf
 import ollama
 import chromadb
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter
 from pydantic import BaseModel, Field
 
 try:
@@ -57,22 +57,21 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 PROMPTS = {
-    "knowledge_extract_system": """You are a precise knowledge extractor. Given document content in markdown, you must output a JSON object with exactly three keys: "glossary", "topic_index", and "domain_rules".
+    "knowledge_extract_system": """You are a precise knowledge extractor. Given document content in markdown, you must output a JSON object with exactly two keys: "glossary" and "domain_rules".
 
 - "glossary": list of objects, each with "term" (string) and "definition" (string). Extract key terms and their definitions from the document.
-- "topic_index": list of strings. List the main topics or section themes in order of appearance.
 - "domain_rules": list of strings. Extract domain rules that should apply when answering questions from this material. Include rules that help an expert in this domain: how to phrase search queries (terminology, key concepts to target), how to reason (what to consider first, what not to assume), how to structure answers (what to include, order, caveats), and terminology/citation constraints (e.g. cite policy numbers, use specific units). Each rule should be one short, actionable sentence.
 
 Output only valid JSON matching the schema. No markdown, no explanation.""",
-    "knowledge_extract_user": """Extract a structured glossary, topic index, and domain rules from the following document content. Output valid JSON only.
+    "knowledge_extract_user": """Extract a structured glossary and domain rules from the following document content. Output valid JSON only.
 
 Document content (markdown):
 ---
 {markdown_preview}
 ---
 
-Use the exact JSON schema: glossary (list of {{"term": "...", "definition": "..."}}), topic_index (list of topic strings), domain_rules (list of rule strings).""",
-    "query_expand_system": """You are a search query expander. Given a knowledge base (glossary, topic index, and domain rules) and a user question, you must output exactly 3 different search queries that would find relevant passages in a vector database.
+Use the exact JSON schema: glossary (list of {{"term": "...", "definition": "..."}}), domain_rules (list of rule strings).""",
+    "query_expand_system": """You are a search query expander. Given a knowledge base (glossary and domain rules) and a user question, you must output exactly 3 different search queries that would find relevant passages in a vector database.
 
 Use the domain rules and glossary to phrase expert-like queries: use domain terminology, target the right concepts, and follow any query-related guidance. Each query should be a short, specific phrase (3-10 words) targeting different aspects: one conceptual, one keyword-focused, one rephrased. Output only valid JSON with a single key "queries" whose value is a list of exactly 3 strings.""",
     "query_expand_user": """Knowledge base summary:
@@ -99,13 +98,12 @@ Context from the knowledge base (each block is labeled with source file and sect
 User question: {question}
 
 Provide your response as JSON only: "answer" (full answer text, citing sources by filename where relevant), "citations" (list of objects with "source" = one of the valid filenames above and "quote" = a short excerpt from that source that supports the answer). Do not use any source name that is not in the valid list.""",
-    "knowledge_compact_system": """You are a knowledge compactor. Given a knowledge base (glossary, topic index, and domain rules), you must output a JSON object with exactly three keys: "glossary", "topic_index", and "domain_rules".
+    "knowledge_compact_system": """You are a knowledge compactor. Given a knowledge base (glossary and domain rules), you must output a JSON object with exactly two keys: "glossary" and "domain_rules".
 
 Your goal is to keep only what is essential for understanding the corpus, for rewriting user questions into good vector-search queries, and for expert-like answering. You must:
-- Deduplicate: merge terms/topics/rules that mean the same thing; keep one canonical form.
+- Deduplicate: merge terms/rules that mean the same thing; keep one canonical form.
 - Prioritize: keep domain-specific terms, central concepts, and the most important domain rules (query guidance, reasoning, answer structure, citation/terminology).
 - Compress: shorten every definition to at most one clear sentence; keep domain rules as short actionable sentences.
-- Keep the topic_index as a concise list of high-level topics and domain_rules as a concise list of rule strings.
 
 Output only valid JSON matching the schema. The total output must stay well under the requested character limit. No markdown, no explanation.""",
     "knowledge_compact_user": """Current knowledge base (may be truncated):
@@ -113,7 +111,7 @@ Output only valid JSON matching the schema. The total output must stay well unde
 {knowledge_preview}
 ---
 
-Produce a condensed glossary, topic index, and domain rules as JSON. Keep only essential terms, topics, and rules. Each definition must be one sentence; each domain rule one short sentence. Output valid JSON only: glossary (list of {{"term": "...", "definition": "..."}}), topic_index (list of topic strings), domain_rules (list of rule strings).""",
+Produce a condensed glossary and domain rules as JSON. Keep only essential terms and rules. Each definition must be one sentence; each domain rule one short sentence. Output valid JSON only: glossary (list of {{"term": "...", "definition": "..."}}), domain_rules (list of rule strings).""",
 }
 
 # -----------------------------------------------------------------------------
@@ -129,10 +127,9 @@ class GlossaryEntry(BaseModel):
 
 
 class KnowledgeSchema(BaseModel):
-    """Structured output for knowledge extraction: glossary, topic index, and domain rules."""
+    """Structured output for knowledge extraction: glossary and domain rules."""
 
     glossary: list[GlossaryEntry] = Field(default_factory=list)
-    topic_index: list[str] = Field(default_factory=list)
     domain_rules: list[str] = Field(default_factory=list)
 
 
@@ -165,11 +162,9 @@ DEFAULT_KNOWLEDGE_PATH = "./knowledge.md"
 DEFAULT_COLLECTION_NAME = "rag_chunks"
 DEFAULT_MODEL = "llama3.2"
 KNOWLEDGE_MARKDOWN_HEADER = "# Knowledge\n\n## Glossary\n\n"
-KNOWLEDGE_TOPIC_HEADER = "\n## Topic Index\n\n"
 KNOWLEDGE_DOMAIN_RULES_HEADER = "\n## Domain rules\n\n"
 DEFAULT_KNOWLEDGE_CONTENT = (
     KNOWLEDGE_MARKDOWN_HEADER + "(empty)\n"
-    + KNOWLEDGE_TOPIC_HEADER + "(empty)\n"
     + KNOWLEDGE_DOMAIN_RULES_HEADER + "(empty)\n"
 )
 MAX_MARKDOWN_FOR_KNOWLEDGE = 12000  # chars per window sent to LLM for knowledge extraction
@@ -180,13 +175,11 @@ MAX_KNOWLEDGE_FOR_COMPACT = 80000  # max chars per compaction window sent to LLM
 N_QUERY_RESULTS = 8
 # Reranking: retrieve more, then cross-encoder rerank and take top K
 RETRIEVE_K = 50          # total chunks to retrieve (before rerank); n_results per query = ceil(RETRIEVE_K/3)
-RERANK_TOP_K = 15        # chunks to keep after reranking
-TOP_N_FOR_PARENTS = 5     # only resolve parent for top N chunks (good parent-to-child ratio)
-PARENT_MIN_CHARS = 100    # only add parent to context if longer than this
-PARENT_MAX_CHARS = 500    # truncate parent to this length when adding to context
+RERANK_TOP_K = 5         # chunks to keep after reranking; then add 1 sibling above+below each → cap at 15
+CONTEXT_CHUNK_CAP = 15   # max chunks in final context (top 5 + their siblings, deduped and sorted)
+SIBLING_ABOVE = 1        # siblings above each top chunk (by chunk_index in same section)
+SIBLING_BELOW = 1        # siblings below each top chunk
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
-MAX_CHUNK_SIZE = 1500   # max chars per vector-store chunk (secondary splitter)
-CHUNK_OVERLAP = 150     # overlap for RecursiveCharacterTextSplitter
 PDF_PAGE_BATCH_SIZE = 50  # pages per batch for converting large PDFs
 # OCR language(s) for scanned PDFs (Tesseract codes; only used when pymupdf.layout is imported)
 OCR_LANGUAGE = "eng+hin"  # English + Hindi (install Tesseract hin data for Hindi)
@@ -381,21 +374,22 @@ class LocalContextRAG:
         indexed.sort(key=lambda x: x[0], reverse=True)
         return [chunk for _, chunk in indexed[:top_k]]
 
-    def _get_parent_chunk(
+    def _get_sibling_chunks(
         self,
         source: str,
         meta: dict[str, Any],
-    ) -> tuple[str, str, dict[str, Any]] | None:
+        above: int = SIBLING_ABOVE,
+        below: int = SIBLING_BELOW,
+    ) -> list[tuple[str, str, dict[str, Any]]]:
         """
-        Resolve the section-root (parent) chunk at query time.
-        For a chunk with (h1, h2, h3), parent is the chunk with same source, h1, h2 and min chunk_index.
-        For (h1, h2), parent is the chunk with same source, h1 and min chunk_index.
-        Returns (doc_text, source, meta) or None if not found or no parent level.
+        Return this chunk plus up to `above` siblings above and `below` siblings below
+        (by chunk_index within the same section: source, h1, h2). Order by chunk_index.
         """
         h1 = meta.get("h1")
         h2 = meta.get("h2")
+        current_ci = _chunk_index_from_meta(meta)
         if h1 is None or not str(h1).strip():
-            return None
+            return []
         where: dict[str, Any] = {"source": source, "h1": str(h1).strip()}
         if h2 is not None and str(h2).strip():
             where["h2"] = str(h2).strip()
@@ -405,26 +399,37 @@ class LocalContextRAG:
                 include=["documents", "metadatas"],
             )
         except Exception as e:
-            logger.debug("Parent chunk lookup failed for %s: %s", where, e)
-            return None
+            logger.debug("Sibling chunk lookup failed for %s: %s", where, e)
+            return []
         ids_list = result.get("ids") or []
         docs = result.get("documents") or []
         metadatas = result.get("metadatas") or []
         if not ids_list or not docs:
-            return None
-        # Chroma get returns flat lists; get first doc and meta per id
-        best_idx = 0
-        best_index = _chunk_index_from_meta(metadatas[0] if metadatas else {})
-        for i in range(1, len(ids_list)):
+            return []
+        # Sort by chunk_index
+        indexed = []
+        for i in range(len(ids_list)):
             ci = _chunk_index_from_meta(metadatas[i] if i < len(metadatas) else {})
-            if ci is not None and (best_index is None or ci < best_index):
-                best_idx = i
-                best_index = ci
-        doc_text = docs[best_idx] if best_idx < len(docs) else ""
-        parent_meta = metadatas[best_idx] if best_idx < len(metadatas) else {}
-        if not doc_text:
-            return None
-        return (doc_text, source, parent_meta)
+            doc_text = docs[i] if i < len(docs) else ""
+            m = metadatas[i] if i < len(metadatas) else {}
+            indexed.append((ci if ci is not None else i, doc_text, source, m))
+        indexed.sort(key=lambda x: (x[0], x[1][:20]))
+        # Find position of current chunk (match by chunk_index)
+        pos = -1
+        for j, (ci, _doc, _src, _m) in enumerate(indexed):
+            if ci == current_ci:
+                pos = j
+                break
+        if pos == -1:
+            return []
+        start = max(0, pos - above)
+        end = min(len(indexed), pos + below + 1)
+        out = []
+        for j in range(start, end):
+            _, doc_text, src, m = indexed[j]
+            if doc_text:
+                out.append((doc_text, src, m))
+        return out
 
     def _ensure_knowledge_file(self) -> str:
         """
@@ -457,68 +462,45 @@ class LocalContextRAG:
 
     def _merge_knowledge(self, parsed: KnowledgeSchema) -> None:
         """
-        Merge parsed glossary, topic_index, and domain_rules into existing knowledge.md.
+        Merge parsed glossary and domain_rules into existing knowledge.md.
         Appends new entries to each section; deduplicates by normalized text.
         """
         content = self._ensure_knowledge_file()
         glossary_marker = "## Glossary"
-        topic_marker = "## Topic Index"
         rules_marker = "## Domain rules"
         idx_glossary = content.find(glossary_marker)
-        idx_topic = content.find(topic_marker)
         idx_rules = content.find(rules_marker)
 
-        # Section bounds: from this section's header until the next ## or end
-        end_glossary = idx_topic if idx_topic != -1 else (idx_rules if idx_rules != -1 else len(content))
-        if idx_topic != -1:
-            end_glossary = min(end_glossary, idx_topic)
-        end_topic = idx_rules if idx_rules != -1 else len(content)
-        if idx_rules != -1:
-            end_topic = min(end_topic, idx_rules)
-        # Body = content after the header line (so we don't include "## X" in parsed bullets)
         def body_after(section_start: int, section_end: int, header: str) -> str:
             if section_start == -1:
                 return ""
             start = section_start + len(header)
             return content[start:section_end].strip()
 
+        end_glossary = idx_rules if idx_rules != -1 else len(content)
         glossary_body = body_after(idx_glossary, end_glossary, glossary_marker) if idx_glossary != -1 else ""
-        topic_body = body_after(idx_topic, end_topic, topic_marker) if idx_topic != -1 else ""
         rules_body = body_after(idx_rules, len(content), rules_marker) if idx_rules != -1 else ""
 
-        # Parse existing items from each section only (so topic vs rule bullets don't mix)
         existing_terms: set[str] = set()
         for line in glossary_body.split("\n"):
             m = re.match(r"^- \*\*(.+?)\*\*:", line)
             if m:
                 existing_terms.add(m.group(1).lower().strip())
-
-        existing_topics: set[str] = set()
-        for line in topic_body.split("\n"):
-            if line.startswith("- ") and "**" not in line:
-                existing_topics.add(line[2:].strip().lower())
-
         existing_rules: set[str] = set()
         for line in rules_body.split("\n"):
             if line.startswith("- "):
                 existing_rules.add(line[2:].strip().lower())
 
-        # Build new lines (skip duplicates)
         new_glossary_lines = []
         for e in parsed.glossary:
             if e.term.lower().strip() not in existing_terms:
                 new_glossary_lines.append(f"- **{e.term}**: {e.definition}")
-        new_topic_lines = []
-        for t in parsed.topic_index:
-            if t.lower().strip() not in existing_topics:
-                new_topic_lines.append(f"- {t}")
         new_rule_lines = []
         for r in parsed.domain_rules:
             key = r.strip().lower()
             if key and key not in existing_rules:
                 new_rule_lines.append(f"- {r.strip()}")
 
-        # Build sections (keep existing body, append new)
         if idx_glossary == -1:
             glossary_section = glossary_marker + "\n\n" + ("\n".join(new_glossary_lines) if new_glossary_lines else "(empty)\n")
         else:
@@ -526,14 +508,6 @@ class LocalContextRAG:
             if new_glossary_lines:
                 existing_glossary += "\n\n" + "\n".join(new_glossary_lines)
             glossary_section = glossary_marker + "\n\n" + existing_glossary
-
-        if idx_topic == -1:
-            topic_section = topic_marker + "\n\n" + ("\n".join(new_topic_lines) if new_topic_lines else "(empty)\n")
-        else:
-            existing_topic = topic_body
-            if new_topic_lines:
-                existing_topic += "\n\n" + "\n".join(new_topic_lines)
-            topic_section = topic_marker + "\n\n" + existing_topic
 
         if idx_rules == -1:
             rules_section = rules_marker + "\n\n" + ("\n".join(new_rule_lines) if new_rule_lines else "(empty)\n")
@@ -543,7 +517,7 @@ class LocalContextRAG:
                 existing_rules_content += "\n\n" + "\n".join(new_rule_lines)
             rules_section = rules_marker + "\n\n" + existing_rules_content
 
-        new_content = "# Knowledge\n\n" + glossary_section + "\n\n" + topic_section + "\n\n" + rules_section + "\n"
+        new_content = "# Knowledge\n\n" + glossary_section + "\n\n" + rules_section + "\n"
         self.knowledge_path.write_text(new_content, encoding="utf-8")
         if len(new_content) >= THRESHOLD_KNOWLEDGE_CHARS:
             self._compact_knowledge()
@@ -569,7 +543,7 @@ class LocalContextRAG:
     def _compact_knowledge(self) -> None:
         """
         If knowledge.md exceeds THRESHOLD_KNOWLEDGE_CHARS (50% of ~128K context),
-        call Ollama to produce a condensed glossary and topic index.
+        call Ollama to produce a condensed glossary and domain rules.
 
         For knowledge.md larger than MAX_KNOWLEDGE_FOR_COMPACT, uses a multi-pass
         sliding window so no content is silently truncated: each window is compacted
@@ -594,10 +568,8 @@ class LocalContextRAG:
                 MAX_KNOWLEDGE_FOR_COMPACT,
             )
             all_glossary: list[GlossaryEntry] = []
-            all_topics: list[str] = []
             all_rules: list[str] = []
             seen_terms: set[str] = set()
-            seen_topics: set[str] = set()
             seen_rules: set[str] = set()
             step = MAX_KNOWLEDGE_FOR_COMPACT - KNOWLEDGE_WINDOW_OVERLAP
             for start in range(0, len(content), step):
@@ -610,33 +582,25 @@ class LocalContextRAG:
                     if key and key not in seen_terms:
                         seen_terms.add(key)
                         all_glossary.append(e)
-                for t in result.topic_index:
-                    key = t.lower().strip()
-                    if key and key not in seen_topics:
-                        seen_topics.add(key)
-                        all_topics.append(t)
                 for r in (result.domain_rules or []):
                     key = r.strip().lower()
                     if key and key not in seen_rules:
                         seen_rules.add(key)
                         all_rules.append(r.strip())
-            parsed = KnowledgeSchema(glossary=all_glossary, topic_index=all_topics, domain_rules=all_rules) if (all_glossary or all_topics or all_rules) else None
+            parsed = KnowledgeSchema(glossary=all_glossary, domain_rules=all_rules) if (all_glossary or all_rules) else None
 
         if parsed is None:
             logger.warning("Compaction parse failed; knowledge.md unchanged.")
             return
         glossary_lines = [f"- **{e.term}**: {e.definition}" for e in parsed.glossary]
-        topic_lines = [f"- {t}" for t in parsed.topic_index]
         rule_lines = [f"- {r}" for r in (parsed.domain_rules or [])]
         glossary_section = "## Glossary\n\n" + ("\n".join(glossary_lines) if glossary_lines else "(empty)")
-        topic_section = "## Topic Index\n\n" + ("\n".join(topic_lines) if topic_lines else "(empty)")
         rules_section = "## Domain rules\n\n" + ("\n".join(rule_lines) if rule_lines else "(empty)")
-        new_content = "# Knowledge\n\n" + glossary_section + "\n\n" + topic_section + "\n\n" + rules_section + "\n"
+        new_content = "# Knowledge\n\n" + glossary_section + "\n\n" + rules_section + "\n"
         self.knowledge_path.write_text(new_content, encoding="utf-8")
         logger.info(
-            "Compacted knowledge.md: %d glossary entries, %d topics, %d domain rules (%d chars).",
+            "Compacted knowledge.md: %d glossary entries, %d domain rules (%d chars).",
             len(parsed.glossary),
-            len(parsed.topic_index),
             len(parsed.domain_rules or []),
             len(new_content),
         )
@@ -655,7 +619,7 @@ class LocalContextRAG:
             return None
 
     def _extract_knowledge_window(self, window: str) -> KnowledgeSchema | None:
-        """Call Ollama to extract glossary and topic index from a single markdown window."""
+        """Call Ollama to extract glossary and domain rules from a single markdown window."""
         user_msg = PROMPTS["knowledge_extract_user"].format(markdown_preview=window)
         try:
             response = ollama.chat(
@@ -676,13 +640,11 @@ class LocalContextRAG:
         """
         Extract a unified KnowledgeSchema from the full markdown by sliding a window
         of MAX_MARKDOWN_FOR_KNOWLEDGE chars with KNOWLEDGE_WINDOW_OVERLAP overlap.
-        Deduplicates glossary terms, topics, and domain rules across all windows.
+        Deduplicates glossary terms and domain rules across all windows.
         """
         all_glossary: list[GlossaryEntry] = []
-        all_topics: list[str] = []
         all_rules: list[str] = []
         seen_terms: set[str] = set()
-        seen_topics: set[str] = set()
         seen_rules: set[str] = set()
 
         step = MAX_MARKDOWN_FOR_KNOWLEDGE - KNOWLEDGE_WINDOW_OVERLAP
@@ -701,11 +663,6 @@ class LocalContextRAG:
                 if key and key not in seen_terms:
                     seen_terms.add(key)
                     all_glossary.append(entry)
-            for topic in parsed.topic_index:
-                key = topic.lower().strip()
-                if key and key not in seen_topics:
-                    seen_topics.add(key)
-                    all_topics.append(topic)
             for r in getattr(parsed, "domain_rules", []) or []:
                 key = r.strip().lower()
                 if key and key not in seen_rules:
@@ -713,13 +670,12 @@ class LocalContextRAG:
                     all_rules.append(r.strip())
 
         logger.info(
-            "Knowledge extraction complete: %d windows, %d terms, %d topics, %d domain rules.",
+            "Knowledge extraction complete: %d windows, %d terms, %d domain rules.",
             window_count,
             len(all_glossary),
-            len(all_topics),
             len(all_rules),
         )
-        return KnowledgeSchema(glossary=all_glossary, topic_index=all_topics, domain_rules=all_rules)
+        return KnowledgeSchema(glossary=all_glossary, domain_rules=all_rules)
 
     def _safe_parse_search_queries(self, raw: str, fallback_query: str) -> SearchQueries:
         """Parse LLM response into SearchQueries; on failure return fallback (same query 3 times)."""
@@ -748,12 +704,18 @@ class LocalContextRAG:
             logger.warning("Failed to parse answer JSON: %s", e)
             return None
 
-    def ingest_document(self, pdf_path: str | Path) -> None:
+    def ingest_document(
+        self,
+        pdf_path: str | Path,
+        markdown_output_dir: str | Path | None = None,
+    ) -> None:
         """
         Ingest a PDF: parse to markdown (with OCR if needed), chunk by headers,
         upsert into ChromaDB, and update knowledge.md via Ollama.
 
         :param pdf_path: Path to the PDF file.
+        :param markdown_output_dir: If set, save the generated markdown to this folder
+            as ``{pdf_stem}.md`` (e.g. ``document.pdf`` → ``document.md``).
         :raises FileNotFoundError: If the PDF file does not exist.
         """
         pdf_path = Path(pdf_path)
@@ -831,30 +793,23 @@ class LocalContextRAG:
             logger.warning("PDF produced empty markdown; skipping chunk upsert, still attempting knowledge update.")
             md = "(Document produced no text content.)"
 
-        # 2) Chunk by headers, then sub-chunk any oversized sections with a character splitter
+        # Optionally save the generated markdown to a dedicated folder
+        if markdown_output_dir is not None:
+            out_dir = Path(markdown_output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_file = out_dir / f"{pdf_path.stem}.md"
+            out_file.write_text(md, encoding="utf-8")
+            logger.info("Saved markdown to %s", out_file)
+
+        # 2) Chunk by headers only (no size-based sub-splitting; sections stay intact including tables)
         headers_to_split_on = [
             ("#", "h1"),
             ("##", "h2"),
             ("###", "h3"),
         ]
         header_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
-        raw_chunks = header_splitter.split_text(md)
-
-        char_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=MAX_CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-        )
-        chunks = []
-        for chunk in raw_chunks:
-            if len(chunk.page_content) > MAX_CHUNK_SIZE:
-                sub_docs = char_splitter.create_documents(
-                    [chunk.page_content],
-                    metadatas=[dict(chunk.metadata)],
-                )
-                chunks.extend(sub_docs)
-            else:
-                chunks.append(chunk)
-        logger.info("Split into %d chunks (%d raw header chunks).", len(chunks), len(raw_chunks))
+        chunks = header_splitter.split_text(md)
+        logger.info("Split into %d chunks (by headers).", len(chunks))
 
         # 3) Upsert into ChromaDB
         if chunks:
@@ -886,12 +841,11 @@ class LocalContextRAG:
         # 4) Update knowledge.md via Ollama (full-document multi-window extraction)
         logger.info("Extracting knowledge from full document (%d chars) via sliding window.", len(md))
         parsed = self._extract_all_knowledge(md)
-        if parsed.glossary or parsed.topic_index or getattr(parsed, "domain_rules", None):
+        if parsed.glossary or getattr(parsed, "domain_rules", None):
             self._merge_knowledge(parsed)
             logger.info(
-                "Merged knowledge (glossary=%d, topics=%d, domain_rules=%d).",
+                "Merged knowledge (glossary=%d, domain_rules=%d).",
                 len(parsed.glossary),
-                len(parsed.topic_index),
                 len(getattr(parsed, "domain_rules", []) or []),
             )
         else:
@@ -1001,43 +955,27 @@ class LocalContextRAG:
                 source = str(raw_source).strip() if raw_source is not None and str(raw_source).strip() else "unknown"
                 seen_ids.add(doc_id)
                 chunks_with_sources.append((doc_text, source, meta))
-        # Rerank with cross-encoder and take top K
+        # Rerank with cross-encoder and take top K (5)
         chunks_with_sources = self._rerank_chunks(question, chunks_with_sources, top_k=RERANK_TOP_K)
-        # Build context: 15 main chunks, then parent chunks (for reference / better context mapping) for top 5 only
+        # For each of the top 5, add 1 sibling above + 1 below (same section); dedupe, sort, cap at 15
+        seen_keys: set[tuple[str, int]] = set()
+        expanded: list[tuple[str, str, dict[str, Any]]] = []
+        for _text, source, meta in chunks_with_sources:
+            for t, src, m in self._get_sibling_chunks(source, meta):
+                ci = _chunk_index_from_meta(m)
+                key = (src, ci if ci is not None else -1)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                expanded.append((t, src, m))
+        expanded.sort(key=lambda x: (x[1], _chunk_index_from_meta(x[2]) or 0))
+        final_chunks = expanded[:CONTEXT_CHUNK_CAP]
         context_parts = [
             f"[Source: {source} | Section: {_section_label(meta)}]\n{text}"
-            for text, source, meta in chunks_with_sources
+            for text, source, meta in final_chunks
         ]
-        set_of_15 = {
-            (src, _chunk_index_from_meta(meta))
-            for _t, src, meta in chunks_with_sources
-        }
-        seen_parent_keys: set[tuple[str, str]] = set()
-        parent_blocks: list[tuple[str, str]] = []  # (section_label, truncated_text)
-        for text, source, meta in chunks_with_sources[:TOP_N_FOR_PARENTS]:
-            parent = self._get_parent_chunk(source, meta)
-            if parent is None:
-                continue
-            p_text, p_source, p_meta = parent
-            p_key = (p_source, _section_label(p_meta))
-            if p_key in seen_parent_keys:
-                continue
-            if (p_source, _chunk_index_from_meta(p_meta)) in set_of_15:
-                continue
-            if len(p_text) <= PARENT_MIN_CHARS:
-                continue
-            seen_parent_keys.add(p_key)
-            truncated = p_text if len(p_text) <= PARENT_MAX_CHARS else p_text[:PARENT_MAX_CHARS].rstrip() + "..."
-            parent_blocks.append((_section_label(p_meta), truncated))
-        if parent_blocks:
-            context_parts.append(
-                "Parent chunks (for reference / better context mapping):\n\n"
-                + "\n\n".join(
-                    f"[Section: {section}]\n{truncated}" for section, truncated in parent_blocks
-                )
-            )
         context = "\n\n---\n\n".join(context_parts) if context_parts else "No relevant context found."
-        valid_sources = ", ".join(sorted({source for _t, source, _m in chunks_with_sources}))
+        valid_sources = ", ".join(sorted({source for _t, source, _m in final_chunks}))
 
         # 4) Structured answer with citations (non-streaming for JSON); inject domain rules into system
         domain_rules_text = self._get_domain_rules_text(knowledge_content)

@@ -3,10 +3,10 @@ Streamlit UI for Global-Context-Aware RAG.
 
 Uses local_context_rag.LocalContextRAG for all operations. Supports:
 Upload PDF, Ask Question, Knowledge Base viewer, Manual Search Vector DB,
-and configurable params (chroma_path, knowledge_path, model, collection_name).
+and configurable params (chroma_path, knowledge_path, model, collection_name,
+ingestion folder for uploaded PDFs and their markdown).
 """
 
-import tempfile
 from pathlib import Path
 
 import streamlit as st
@@ -19,6 +19,9 @@ from local_context_rag import (
     LocalContextRAG,
 )
 
+# Default folder where uploaded PDFs are stored; each PDF's markdown is saved here too.
+DEFAULT_INGESTION_FOLDER = "ingestion"
+
 
 def _init_session_state() -> None:
     if "chroma_path" not in st.session_state:
@@ -29,6 +32,8 @@ def _init_session_state() -> None:
         st.session_state.model = DEFAULT_MODEL
     if "collection_name" not in st.session_state:
         st.session_state.collection_name = DEFAULT_COLLECTION_NAME
+    if "ingestion_folder" not in st.session_state:
+        st.session_state.ingestion_folder = DEFAULT_INGESTION_FOLDER
 
 
 def _get_rag() -> LocalContextRAG | None:
@@ -59,12 +64,14 @@ def main() -> None:
     knowledge_path = st.sidebar.text_input("Knowledge path", value=st.session_state.knowledge_path, key="sidebar_knowledge_path")
     model = st.sidebar.text_input("Ollama model", value=st.session_state.model, key="sidebar_model")
     collection_name = st.sidebar.text_input("Collection name", value=st.session_state.collection_name, key="sidebar_collection_name")
+    ingestion_folder = st.sidebar.text_input("Ingestion folder", value=st.session_state.ingestion_folder, key="sidebar_ingestion_folder", help="Uploaded PDFs and their .md files are saved here.")
 
     if st.sidebar.button("Apply"):
         st.session_state.chroma_path = chroma_path.strip() or DEFAULT_CHROMA_PATH
         st.session_state.knowledge_path = knowledge_path.strip() or DEFAULT_KNOWLEDGE_PATH
         st.session_state.model = model.strip() or DEFAULT_MODEL
         st.session_state.collection_name = collection_name.strip() or DEFAULT_COLLECTION_NAME
+        st.session_state.ingestion_folder = ingestion_folder.strip() or DEFAULT_INGESTION_FOLDER
         if "rag" in st.session_state:
             del st.session_state["rag"]
         st.sidebar.success("Settings applied. RAG will be re-created on next use.")
@@ -82,15 +89,14 @@ def main() -> None:
                 st.error("RAG not available. Check Settings.")
             else:
                 try:
-                    # Save with original filename so citations show the real PDF name
+                    # Save to dedicated ingestion folder; keep PDF and save markdown there too
                     original_name = Path(uploaded.name).name or "uploaded.pdf"
-                    tmp_path = Path(tempfile.gettempdir()) / original_name
-                    tmp_path.write_bytes(uploaded.getvalue())
-                    try:
-                        rag.ingest_document(tmp_path)
-                        st.success("PDF ingested successfully.")
-                    finally:
-                        tmp_path.unlink(missing_ok=True)
+                    ingestion_dir = Path(st.session_state.ingestion_folder)
+                    ingestion_dir.mkdir(parents=True, exist_ok=True)
+                    pdf_path = ingestion_dir / original_name
+                    pdf_path.write_bytes(uploaded.getvalue())
+                    rag.ingest_document(pdf_path, markdown_output_dir=ingestion_dir)
+                    st.success(f"PDF ingested. Saved: {pdf_path} and {pdf_path.stem}.md in {ingestion_dir}.")
                 except Exception as e:
                     st.error(f"Ingestion failed: {e}")
 
